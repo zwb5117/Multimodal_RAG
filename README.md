@@ -23,6 +23,9 @@
 - **Ragas 评估框架**：集成 ContextPrecision / ContextRecall / ResponseRelevancy / Faithfulness 评估
 - **流式 SSE 输出**：支持 Server-Sent Events 流式返回答案
 
+### 测试实例
+![演示图](./image.png)
+
 ## 技术架构
 
 ```
