@@ -110,25 +110,44 @@ def step_3_trigger_compact(
     compact_engine: ContextCompactEngine,
     cache_manager: RedisCacheManager
 ) -> None:
-    """检查是否需要触发历史压缩（首次>=5轮 / 增量>=3轮时压缩并缓存到 Redis）"""
+    """检查是否需要触发历史压缩（首次>=5轮全量 / 增量>=3轮仅压缩新增并拼接旧摘要）"""
     try:
         # 1. 读取上次压缩状态（从未压缩过则返回 turn_count=0）
         compact_state = cache_manager.get_compact_state(session_id)
         last_compact_turn_count = compact_state.get("last_compact_turn_count", 0)
+        last_summary_id = compact_state.get("last_summary_id", "")
 
         # 2. 增量判断：首次 >=5 轮触发，之后每新增 >=3 轮再触发
         if compact_engine.should_compact(history, last_compact_turn_count):
+            # 3. 如果是增量压缩，从 Redis 读取上次的 compressed_history
+            previous_compressed_history = ""
+            if last_compact_turn_count > 0 and last_summary_id:
+                prev_summary = cache_manager.get_summary_by_key(
+                    f"qa:summary:{session_id}:{last_summary_id}"
+                )
+                if prev_summary:
+                    previous_compressed_history = prev_summary.get("compressed_history", "")
+                    logger.info(
+                        f"[缓存检查] 读取到上次摘要 compressed_history，"
+                        f"长度={len(previous_compressed_history)}，summary_id={last_summary_id}"
+                    )
+
             logger.info(
                 f"[缓存检查] 触发历史压缩（会话 {session_id}），"
-                f"上次压缩轮数={last_compact_turn_count}"
+                f"上次压缩轮数={last_compact_turn_count}，"
+                f"模式={'增量' if previous_compressed_history else '全量（首次）'}"
             )
             compact_result = compact_engine.compact(
-                session_id=session_id, history=history, force=False
+                session_id=session_id,
+                history=history,
+                force=False,
+                last_compact_turn_count=last_compact_turn_count,
+                previous_compressed_history=previous_compressed_history
             )
             if compact_result:
                 summary_id = cache_manager.save_summary(session_id, compact_result)
                 if summary_id:
-                    # 3. 记录压缩状态标记位，供下次增量判断
+                    # 4. 记录压缩状态标记位，供下次增量判断
                     turn_count = compact_result.get("turn_count", 0)
                     cache_manager.save_compact_state(session_id, turn_count, summary_id)
                     logger.info(

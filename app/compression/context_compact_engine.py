@@ -2,17 +2,18 @@
 Context Compact 压缩引擎模块
 功能：对超过指定轮数的对话历史进行智能压缩摘要，生成紧凑的对话摘要
 核心流程：
-  1. 轮数检测：检查历史对话是否超过阈值
-  2. 提取历史：从 MongoDB 获取指定会话的全部历史记录
-  3. 构造数据：按 user/assistant 交替格式组织历史文本
-  4. LLM 压缩：调用大模型对历史对话进行语义摘要压缩
-  5. 结果缓存：将摘要结果缓存到 Redis（含 query/answer/compressed_history）
-  6. 分析记录：生成压缩过程解析文件到 context_compact/ 目录
+  1. 轮数检测：检查历史对话是否超过阈值（首次 >=5轮 / 增量 >=3轮）
+  2. 增量切片：增量模式下仅取上次压缩之后的新对话，避免 LLM 重复处理
+  3. 提取历史：从 MongoDB 获取指定会话的全部历史记录
+  4. 构造数据：按 user/assistant 交替格式组织历史文本
+  5. LLM 压缩：调用大模型对增量对话进行语义摘要压缩
+  6. 摘要拼接：增量模式下将新压缩内容追加到旧摘要后，形成完整压缩历史
+  7. 结果缓存：将摘要结果缓存到 Redis（含 query/answer/compressed_history）
+  8. 分析记录：生成压缩过程解析文件到 context_compact/ 目录
 
 压缩策略：
-  - 保留核心语义：提取用户核心问题与助手关键回答，去除寒暄和冗余
-  - 保持对话脉络：按轮次顺序压缩，保留对话的上下文连贯性
-  - 实体完整性：保留涉及的商品名/实体名，确保后续检索的精准性
+  - 全量压缩（首次）：保留核心语义 + 保持对话脉络 + 实体完整性
+  - 增量压缩（后续）：仅压缩新增对话，与旧摘要拼接，大幅减少 LLM 调用成本
   - 比例控制：压缩后长度控制原内容的 30%~50% 之间
 """
 import json
@@ -132,6 +133,42 @@ class ContextCompactEngine:
                 lines.append(f"[助手]: {text}")
         return "\n".join(lines), turn_count
 
+    def _slice_incremental_history(
+        self,
+        history: List[Dict[str, Any]],
+        last_compact_turn_count: int
+    ) -> List[Dict[str, Any]]:
+        """
+        从完整历史中截取增量部分：仅保留 last_compact_turn_count 之后的对话
+        原理：遍历历史，统计 user 消息数，跳过前 last_compact_turn_count 轮，
+              从第 last_compact_turn_count+1 轮开始保留
+        参数：
+            history: 完整历史对话列表
+            last_compact_turn_count: 上次压缩时已覆盖的 user 轮数
+        返回：
+            增量历史列表（仅包含上次压缩之后的新对话）
+        """
+        if last_compact_turn_count <= 0:
+            return history
+
+        user_seen = 0
+        for i, msg in enumerate(history):
+            if msg.get("role") == "user":
+                user_seen += 1
+            if user_seen > last_compact_turn_count:
+                # 找到了增量起点：从这里开始返回
+                sliced = history[i:]
+                new_user_count = sum(1 for m in sliced if m.get("role") == "user")
+                logger.info(
+                    f"[压缩引擎] 增量切片：全量 user={user_seen}轮，"
+                    f"跳过前{last_compact_turn_count}轮，保留增量{new_user_count}轮"
+                )
+                return sliced
+
+        # 兜底：没找到增量起点（理论上不会发生），返回空
+        logger.warning(f"[压缩引擎] 增量切片未找到起点，last_compact={last_compact_turn_count}")
+        return []
+
     def _extract_item_names(self, history: List[Dict[str, Any]]) -> List[str]:
         """
         从历史记录中提取涉及的商品名/实体名
@@ -152,26 +189,24 @@ class ContextCompactEngine:
         self,
         session_id: str,
         history: Optional[List[Dict[str, Any]]] = None,
-        force: bool = False
+        force: bool = False,
+        last_compact_turn_count: int = 0,
+        previous_compressed_history: str = ""
     ) -> Optional[Dict[str, Any]]:
         """
         执行对话历史压缩（核心方法）
+        策略：
+          - 首次压缩（last_compact_turn_count==0）：全量压缩全部历史
+          - 增量压缩（last_compact_turn_count>0）：仅压缩上次压缩之后的新对话，
+            然后与 previous_compressed_history 拼接，避免 LLM 重复处理旧内容
         参数：
             session_id: 会话 ID
             history: 历史对话列表（可选，不传则自动从 MongoDB 获取最近 50 条）
             force: 是否强制压缩（跳过轮数检测）
+            last_compact_turn_count: 上次压缩时的会话轮数，0 表示首次
+            previous_compressed_history: 上次压缩产生的完整 compressed_history 文本
         返回：
-            压缩结果字典，包含：
-              - summary_query: 压缩后的核心问题摘要
-              - summary_answer: 压缩后的核心答案摘要
-              - compressed_history: 完整的历史压缩文本
-              - item_names: 涉及的商品名列表
-              - turn_count: 原始对话轮数
-              - original_length: 原始文本长度
-              - compressed_length: 压缩后文本长度
-              - compression_ratio: 压缩比
-              - timestamp: 压缩时间戳
-            压缩失败或无需压缩返回 None
+            压缩结果字典，失败或无需压缩返回 None
         """
         try:
             # 1. 获取历史记录（如果未传入则从 MongoDB 拉取）
@@ -183,31 +218,63 @@ class ContextCompactEngine:
                 return None
 
             # 2. 轮数检测（除非强制跳过）
-            if not force and not self.should_compact(history):
+            if not force and not self.should_compact(history, last_compact_turn_count):
                 logger.debug(f"[压缩引擎] 会话 {session_id} 未达到压缩阈值，跳过")
                 return None
 
-            # 3. 格式化历史文本
-            history_text, turn_count = self._format_history_for_llm(history)
-            original_length = len(history_text)
-            logger.info(f"[压缩引擎] 开始压缩会话 {session_id}，共 {turn_count} 轮，长度 {original_length} 字符")
+            # 3. 增量切片：仅取上次压缩之后的新对话，避免 LLM 重复处理旧内容
+            is_incremental = last_compact_turn_count > 0 and previous_compressed_history
+            if is_incremental:
+                target_history = self._slice_incremental_history(history, last_compact_turn_count)
+                if not target_history:
+                    logger.warning(f"[压缩引擎] 增量切片为空，跳过压缩")
+                    return None
+                logger.info(
+                    f"[压缩引擎] 增量压缩模式：仅压缩新增部分，"
+                    f"上次已压缩{last_compact_turn_count}轮，"
+                    f"本次新增{sum(1 for m in target_history if m.get('role') == 'user')}轮"
+                )
+            else:
+                target_history = history
+                logger.info(f"[压缩引擎] 全量压缩模式：首次压缩全部历史")
 
-            # 4. 提取商品名
+            # 4. 格式化历史文本
+            history_text, new_turn_count = self._format_history_for_llm(target_history)
+            # 全量 user 轮数（从完整 history 统计，用于记录）
+            total_turn_count = sum(1 for msg in history if msg.get("role") == "user")
+            original_length = len(history_text)
+            logger.info(f"[压缩引擎] 开始压缩会话 {session_id}，新增 {new_turn_count} 轮，长度 {original_length} 字符")
+
+            # 5. 提取商品名（从全量历史提取，保证实体完整性）
             item_names = self._extract_item_names(history)
 
-            # 5. 调用 LLM 进行压缩
+            # 6. 调用 LLM 压缩（仅压缩增量部分）
             logger.info(f"[压缩引擎] 调用 LLM 进行语义压缩...")
-            compressed_text = self._call_llm_compact(history_text, turn_count)
+            compressed_new = self._call_llm_compact(history_text, new_turn_count)
 
-            if not compressed_text:
+            if not compressed_new:
                 logger.warning(f"[压缩引擎] LLM 压缩返回空，使用原文截断作为降级")
-                compressed_text = history_text[:1000] + "..." if len(history_text) > 1000 else history_text
+                compressed_new = history_text[:1000] + "..." if len(history_text) > 1000 else history_text
+
+            # 7. 拼接：增量模式下将新压缩内容追加到旧摘要后
+            if is_incremental and previous_compressed_history:
+                compressed_text = (
+                    previous_compressed_history
+                    + "\n\n---\n[后续对话]\n"
+                    + compressed_new
+                )
+                logger.info(
+                    f"[压缩引擎] 增量拼接完成：旧摘要{len(previous_compressed_history)}字 + "
+                    f"新压缩{len(compressed_new)}字 = {len(compressed_text)}字"
+                )
+            else:
+                compressed_text = compressed_new
 
             compressed_length = len(compressed_text)
             ratio = round((1 - compressed_length / max(original_length, 1)) * 100, 2)
             logger.info(f"[压缩引擎] 压缩完成: {original_length} → {compressed_length} 字符，压缩比 {ratio}%")
 
-            # 6. 构建压缩结果
+            # 8. 构建压缩结果（turn_count 记录全量轮数，供增量压缩标记位使用）
             summary_id = str(uuid.uuid4())[:8]
             result = {
                 "summary_id": summary_id,
@@ -216,15 +283,15 @@ class ContextCompactEngine:
                 "summary_answer": self._extract_core_answer(compressed_text),
                 "compressed_history": compressed_text,
                 "item_names": item_names,
-                "turn_count": turn_count,
+                "turn_count": total_turn_count,
                 "original_length": original_length,
                 "compressed_length": compressed_length,
                 "compression_ratio": ratio,
                 "timestamp": datetime.now().timestamp(),
             }
 
-            # 7. 生成压缩过程分析文件
-            self._write_analysis_file(session_id, summary_id, result, history_text)
+            # 9. 生成压缩过程分析文件
+            self._write_analysis_file(session_id, summary_id, result, history_text, is_incremental)
 
             logger.info(f"[压缩引擎] 会话 {session_id} 压缩成功，摘要ID={summary_id}")
             return result
@@ -289,7 +356,8 @@ class ContextCompactEngine:
         session_id: str,
         summary_id: str,
         result: Dict[str, Any],
-        original_text: str
+        original_text: str,
+        is_incremental: bool = False
     ) -> None:
         """
         生成压缩过程解析文件到 context_compact/analysis/ 目录
@@ -314,7 +382,8 @@ class ContextCompactEngine:
                     "压缩引擎版本": "1.0.0",
                 },
                 "一、压缩触发条件": {
-                    "触发机制": "当会话轮数超过阈值(5轮)时自动触发",
+                    "触发机制": "首次 >= 5 轮触发全量压缩；之后每新增 >= 3 轮触发增量压缩（仅压缩新增部分并拼接旧摘要）",
+                    "压缩模式": "增量压缩" if is_incremental else "全量压缩（首次）",
                     "当前会话轮数": f"{result['turn_count']} 轮",
                     "压缩阈值": f"{redis_config.compact_turn_threshold} 轮",
                     "是否达到阈值": result['turn_count'] >= redis_config.compact_turn_threshold,
