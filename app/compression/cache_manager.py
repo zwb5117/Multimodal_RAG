@@ -239,6 +239,75 @@ class RedisCacheManager:
             logger.error(f"[缓存管理器] 删除摘要失败：session={session_id}, summary_id={summary_id}, error={str(e)}")
             return False
 
+    # ==================== 压缩状态管理（增量压缩标记位） ====================
+
+    def save_compact_state(self, session_id: str, turn_count: int, summary_id: str) -> bool:
+        """
+        保存压缩状态标记位到 Redis，用于增量压缩判断
+        存储结构：qa:session:{session_id}:compact_state → Hash
+        字段：
+          - last_compact_turn_count: 上次压缩时的会话轮数
+          - last_compact_time: 上次压缩时间戳
+          - last_summary_id: 上次生成的摘要 ID
+        参数：
+            session_id: 会话 ID
+            turn_count: 本次压缩时的会话轮数
+            summary_id: 本次生成的摘要 ID
+        返回：
+            True=写入成功, False=失败
+        """
+        client = self._get_client()
+        if client is None:
+            return False
+
+        try:
+            state_key = f"qa:session:{session_id}:compact_state"
+            state_data = {
+                "last_compact_turn_count": str(turn_count),
+                "last_compact_time": str(datetime.now().timestamp()),
+                "last_summary_id": summary_id,
+            }
+            client.hset(state_key, state_data, ttl=redis_config.cache_ttl)
+            logger.info(
+                f"[缓存管理器] 压缩状态已记录：session={session_id}, "
+                f"last_compact_turn={turn_count}, summary_id={summary_id}"
+            )
+            return True
+        except Exception as e:
+            logger.error(f"[缓存管理器] 保存压缩状态失败：session={session_id}, error={str(e)}")
+            return False
+
+    def get_compact_state(self, session_id: str) -> Dict[str, Any]:
+        """
+        获取会话的压缩状态标记位
+        参数：
+            session_id: 会话 ID
+        返回：
+            状态字典，包含：
+              - last_compact_turn_count: int（默认 0，表示从未压缩过）
+              - last_summary_id: str（默认空字符串）
+              - last_compact_time: float（默认 0）
+            Redis 不可用或 key 不存在时返回全零字典
+        """
+        client = self._get_client()
+        if client is None:
+            return {"last_compact_turn_count": 0, "last_summary_id": "", "last_compact_time": 0}
+
+        try:
+            state_key = f"qa:session:{session_id}:compact_state"
+            data = client.hgetall(state_key)
+            if not data:
+                return {"last_compact_turn_count": 0, "last_summary_id": "", "last_compact_time": 0}
+
+            return {
+                "last_compact_turn_count": int(float(data.get("last_compact_turn_count", "0"))),
+                "last_summary_id": data.get("last_summary_id", ""),
+                "last_compact_time": float(data.get("last_compact_time", "0")),
+            }
+        except Exception as e:
+            logger.error(f"[缓存管理器] 读取压缩状态失败：session={session_id}, error={str(e)}")
+            return {"last_compact_turn_count": 0, "last_summary_id": "", "last_compact_time": 0}
+
     # ==================== 状态检查 ====================
 
     def get_cache_status(self, session_id: str) -> Dict[str, Any]:

@@ -54,12 +54,19 @@ class ContextCompactEngine:
             logger.warning(f"创建压缩分析目录失败: {e}")
             self.compact_dir = None
 
-    def should_compact(self, history: List[Dict[str, Any]]) -> bool:
+    def should_compact(
+        self,
+        history: List[Dict[str, Any]],
+        last_compact_turn_count: int = 0
+    ) -> bool:
         """
-        判断是否需要执行压缩
-        条件：会话轮数（user + assistant 消息对数）超过阈值
+        判断是否需要执行压缩（支持增量压缩策略）
+        策略：
+          - 从未压缩过：会话轮数 >= compact_turn_threshold（默认 5）时首次触发
+          - 已压缩过：  新增轮数 >= compact_incremental_threshold（默认 3）时再次触发
         参数：
             history: 历史对话列表（每条含 role/text 字段）
+            last_compact_turn_count: 上次压缩时的会话轮数，0 表示从未压缩过
         返回：
             True=需要压缩, False=不需要
         """
@@ -68,13 +75,34 @@ class ContextCompactEngine:
 
         # 计算完整对话轮数（一对 user+assistant 算一轮）
         user_count = sum(1 for msg in history if msg.get("role") == "user")
-        threshold = redis_config.compact_turn_threshold
 
-        need = user_count >= threshold
-        if need:
-            logger.info(f"[压缩检测] 会话轮数({user_count}) >= 阈值({threshold})，触发压缩")
+        if last_compact_turn_count == 0:
+            # 从未压缩过：使用首次触发阈值
+            threshold = redis_config.compact_turn_threshold
+            need = user_count >= threshold
+            if need:
+                logger.info(
+                    f"[压缩检测] 首次触发：会话轮数({user_count}) >= 阈值({threshold})，触发压缩"
+                )
+            else:
+                logger.debug(
+                    f"[压缩检测] 会话轮数({user_count}) < 阈值({threshold})，跳过压缩"
+                )
         else:
-            logger.debug(f"[压缩检测] 会话轮数({user_count}) < 阈值({threshold})，跳过压缩")
+            # 已压缩过：使用增量阈值
+            new_turns = user_count - last_compact_turn_count
+            inc_threshold = redis_config.compact_incremental_threshold
+            need = new_turns >= inc_threshold
+            if need:
+                logger.info(
+                    f"[压缩检测] 增量触发：新增轮数({new_turns}) >= 增量阈值({inc_threshold})，"
+                    f"当前总轮数({user_count})，上次压缩时({last_compact_turn_count})"
+                )
+            else:
+                logger.debug(
+                    f"[压缩检测] 新增轮数({new_turns}) < 增量阈值({inc_threshold})，"
+                    f"当前总轮数({user_count})，跳过压缩"
+                )
 
         return need
 

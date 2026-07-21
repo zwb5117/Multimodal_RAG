@@ -110,17 +110,31 @@ def step_3_trigger_compact(
     compact_engine: ContextCompactEngine,
     cache_manager: RedisCacheManager
 ) -> None:
-    """检查是否需要触发历史压缩（>=5轮时压缩并缓存到 Redis）"""
+    """检查是否需要触发历史压缩（首次>=5轮 / 增量>=3轮时压缩并缓存到 Redis）"""
     try:
-        if compact_engine.should_compact(history):
-            logger.info(f"[缓存检查] 触发历史压缩（会话 {session_id}）")
+        # 1. 读取上次压缩状态（从未压缩过则返回 turn_count=0）
+        compact_state = cache_manager.get_compact_state(session_id)
+        last_compact_turn_count = compact_state.get("last_compact_turn_count", 0)
+
+        # 2. 增量判断：首次 >=5 轮触发，之后每新增 >=3 轮再触发
+        if compact_engine.should_compact(history, last_compact_turn_count):
+            logger.info(
+                f"[缓存检查] 触发历史压缩（会话 {session_id}），"
+                f"上次压缩轮数={last_compact_turn_count}"
+            )
             compact_result = compact_engine.compact(
                 session_id=session_id, history=history, force=False
             )
             if compact_result:
                 summary_id = cache_manager.save_summary(session_id, compact_result)
                 if summary_id:
-                    logger.info(f"[缓存检查] 压缩摘要已缓存，summary_id={summary_id}")
+                    # 3. 记录压缩状态标记位，供下次增量判断
+                    turn_count = compact_result.get("turn_count", 0)
+                    cache_manager.save_compact_state(session_id, turn_count, summary_id)
+                    logger.info(
+                        f"[缓存检查] 压缩完成并记录状态，summary_id={summary_id}, "
+                        f"turn_count={turn_count}"
+                    )
     except Exception as e:
         logger.error(f"[缓存检查] 压缩/缓存异常: {str(e)}")
 
